@@ -1,5 +1,7 @@
 //! Worker server implementation using Axum
 
+use std::time::Duration;
+
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get, serve::Serve};
 use color_eyre::Result;
 use tokio::net::TcpListener;
@@ -8,12 +10,13 @@ use tower_http::trace::TraceLayer;
 use crate::tracing::{make_span_with_request_id, on_request, on_response};
 
 pub struct WorkerServer {
+    pub id: u8,
     pub address: String,
     server: Serve<TcpListener, Router, Router>,
 }
 
 impl WorkerServer {
-    pub async fn build(address: &str) -> Result<Self> {
+    pub async fn build(id: u8, address: &str) -> Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let router = Router::new()
             .route("/work", get(work))
@@ -26,6 +29,7 @@ impl WorkerServer {
             );
         let server = axum::serve(listener, router);
         Ok(WorkerServer {
+            id,
             address: address.to_string(),
             server,
         })
@@ -45,6 +49,8 @@ pub async fn check_health() -> std::result::Result<impl IntoResponse, WorkerErro
 /// Send work to worker
 #[tracing::instrument(name = "Work")]
 pub async fn work() -> std::result::Result<impl IntoResponse, WorkerError> {
+    // Delay the response to simulate some work ongoing
+    tokio::time::sleep(Duration::from_millis(10)).await;
     Ok(StatusCode::OK)
 }
 
