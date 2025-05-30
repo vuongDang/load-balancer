@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hyper-util = { version = "0.1", features = ["full"] }
+tokio = { version = "1.45.1", features = ["full"] }
+color-eyre = "0.6.4"
+hyper = { version = "1.6.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.19", features = [
+    "registry",
+    "env-filter",
+] }
+http-body-util = "0.1"
