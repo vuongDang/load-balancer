@@ -1,18 +1,24 @@
 //! Worker server implementation using Axum
 
-use std::time::Duration;
+use std::{path::Display, time::Duration};
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get, serve::Serve};
 use color_eyre::Result;
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
 use crate::tracing::{make_span_with_request_id, on_request, on_response};
 
 pub struct WorkerServer {
+    pub config: WorkerConfig,
+    server: Serve<TcpListener, Router, Router>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
     pub id: u8,
     pub address: String,
-    server: Serve<TcpListener, Router, Router>,
 }
 
 impl WorkerServer {
@@ -30,13 +36,12 @@ impl WorkerServer {
             );
         let server = axum::serve(listener, router);
         Ok(WorkerServer {
-            id,
-            address,
+            config: WorkerConfig { id, address },
             server,
         })
     }
     pub async fn run(self) -> Result<(), std::io::Error> {
-        tracing::info!("Starting worker on {}", self.address);
+        tracing::info!("Starting worker on {}", self.config.address);
         self.server.await
     }
 }
@@ -55,7 +60,8 @@ pub async fn work() -> std::result::Result<impl IntoResponse, WorkerError> {
     Ok(StatusCode::OK)
 }
 
-struct WorkerError(color_eyre::Report);
+#[derive(Debug, Error)]
+pub struct WorkerError(color_eyre::Report);
 impl IntoResponse for WorkerError {
     fn into_response(self) -> axum::response::Response {
         (
@@ -63,6 +69,12 @@ impl IntoResponse for WorkerError {
             format!("Something went wrong: {}", self.0),
         )
             .into_response()
+    }
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -75,7 +87,7 @@ mod tests {
         let worker = WorkerServer::build(0, addr)
             .await
             .expect("Failed to run server");
-        let addr = worker.address.clone();
+        let addr = worker.config.address.clone();
         tokio::spawn(worker.run());
         addr
     }
