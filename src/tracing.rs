@@ -10,7 +10,7 @@ pub fn init_tracing() -> color_eyre::eyre::Result<()> {
 
     // Create a layer that filters logs based on the environment variable
     let filter_layer =
-        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("debug"))?;
+        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("trace"))?;
 
     tracing_subscriber::registry()
         .with(fmt_layer)

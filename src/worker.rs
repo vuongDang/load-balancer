@@ -1,6 +1,6 @@
 //! Worker server implementation using Axum
 
-use std::{path::Display, time::Duration};
+use std::time::Duration;
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get, serve::Serve};
 use color_eyre::Result;
@@ -15,9 +15,10 @@ pub struct WorkerServer {
     server: Serve<TcpListener, Router, Router>,
 }
 
+pub type WorkerId = u8;
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    pub id: u8,
+    pub id: WorkerId,
     pub address: String,
 }
 
