@@ -1,6 +1,6 @@
 use super::server::LoadBalancerState;
-use crate::worker::{self, WorkerConfig, WorkerId};
-use std::sync::Arc;
+use crate::worker::{WorkerConfig, WorkerId};
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Default, Debug)]
 pub enum BalancingStrategy {
@@ -58,4 +58,12 @@ async fn random(workers: Vec<WorkerConfig>) -> WorkerConfig {
         .find(|worker| worker.id == id)
         .expect("Worker not found");
     worker.clone()
+}
+
+// Pick the worker with least request givent
+async fn least_connection(
+    worker: Vec<WorkerConfig>,
+    connection_history: &Arc<Mutex<HashMap<WorkerId, u64>>>,
+) -> WorkerConfig {
+    worker.first().unwrap().clone()
 }

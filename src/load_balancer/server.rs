@@ -1,3 +1,4 @@
+use crate::load_balancer::balancing_strategy::BalancingStrategy;
 use crate::worker::WorkerConfig;
 use axum::{
     body::Body,
@@ -6,22 +7,20 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-// use hyper::Response;
-use crate::load_balancer::balancing_strategy::BalancingStrategy;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
 use uuid::Uuid;
-// use hyper::client::conn::http1;
-// use hyper_util::rt::TokioIo;
-// use tower::Service;
 
 pub struct LoadBalancer {}
 
 #[derive(Clone, Debug)]
 pub struct LoadBalancerState {
+    #[allow(dead_code)]
     pub(crate) address: String,
+    // The worker servers available to the load balancer
     pub(crate) workers: Vec<WorkerConfig>,
+    // The balancing strategy being currently employed
     pub(crate) strategy: Arc<RwLock<BalancingStrategy>>,
 }
 
