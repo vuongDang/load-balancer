@@ -7,7 +7,7 @@ use load_balancer::{
 };
 use tokio::{sync::Mutex, task::JoinSet};
 
-static NB_WORKERS: u8 = 1;
+static NB_WORKERS: u32 = 1;
 static IP: &'static str = "127.0.0.1";
 
 #[tokio::main]

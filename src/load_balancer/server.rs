@@ -52,7 +52,7 @@ pub async fn handle_request(
     let request_id = Uuid::new_v4();
     tracing::trace!("[{}] received", request_id);
 
-    let chosen_worker = BalancingStrategy::pick_worker(state).await;
+    let chosen_worker = BalancingStrategy::pick_worker(state).await?;
     tracing::trace!("[{}] chosen worker {}", request_id, chosen_worker.id);
 
     // Send request to chosen worker

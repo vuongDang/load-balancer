@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Request, State},
     http::StatusCode,
@@ -19,6 +19,7 @@ use axum::{
     serve::Serve,
 };
 use color_eyre::Result;
+use rand::Rng;
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -32,8 +33,8 @@ pub struct WorkerServer {
     server: Serve<TcpListener, Router, Router>,
 }
 
-pub type WorkerId = u8;
-#[derive(Debug, Clone)]
+pub type WorkerId = u32;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerConfig {
     pub id: WorkerId,
     pub address: String,
@@ -42,20 +43,23 @@ pub struct WorkerConfig {
 /// State that contains information that can be useful for the load balancer
 #[derive(Clone, Debug)]
 pub struct WorkerState {
+    config: WorkerConfig,
     nb_requests_received: Arc<AtomicU32>,
     nb_requests_being_handled: Arc<AtomicU16>,
 }
 
 impl WorkerServer {
-    pub async fn build(id: u8, address: &str) -> Result<Self> {
+    pub async fn build(id: u32, address: &str) -> Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?.to_string();
+        let config = WorkerConfig { id, address };
         let state = WorkerState {
+            config: config.clone(),
             nb_requests_received: Arc::new(AtomicU32::new(0)),
             nb_requests_being_handled: Arc::new(AtomicU16::new(0)),
         };
         let router = Router::new()
-            .route("/work", get(work))
+            .route("/work", axum::routing::post(work))
             .route("/check-health", get(check_health))
             .route("/state", get(get_worker_state))
             .layer(RequestStatsLayer {
@@ -69,14 +73,22 @@ impl WorkerServer {
                     .on_response(on_response),
             );
         let server = axum::serve(listener, router);
-        Ok(WorkerServer {
-            config: WorkerConfig { id, address },
-            server,
-        })
+        Ok(WorkerServer { config, server })
     }
     pub async fn run(self) -> Result<(), std::io::Error> {
         tracing::info!("Starting worker on {}", self.config.address);
         self.server.await
+    }
+
+    pub async fn create_and_run_worker() -> WorkerConfig {
+        const LOCAL_ADDR: &'static str = "127.0.0.1:0";
+        let id = rand::rng().random::<u32>();
+        let worker = WorkerServer::build(id, LOCAL_ADDR)
+            .await
+            .expect("Failed to run server");
+        let config = worker.config.clone();
+        tokio::spawn(worker.run());
+        config
     }
 }
 
@@ -85,16 +97,23 @@ impl WorkerServer {
 pub async fn check_health(
     State(state): State<WorkerState>,
 ) -> std::result::Result<impl IntoResponse, WorkerError> {
-    println!("{:?}", state);
     Ok(StatusCode::OK)
 }
 
 /// Send work to worker
 #[tracing::instrument(name = "Work")]
-pub async fn work() -> std::result::Result<impl IntoResponse, WorkerError> {
+pub async fn work(
+    State(_state): State<WorkerState>,
+    Json(request): Json<WorkRequest>,
+) -> std::result::Result<impl IntoResponse, WorkerError> {
     // Delay the response to simulate some work ongoing
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(request.duration)).await;
     Ok(StatusCode::OK)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct WorkRequest {
+    duration: u64,
 }
 
 pub async fn get_worker_state(
@@ -200,7 +219,9 @@ impl Serialize for WorkerState {
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("config", &self.config)?;
+
         map.serialize_entry(
             "nb_requests_received",
             &self.nb_requests_received.load(Ordering::Acquire),
@@ -214,25 +235,19 @@ impl Serialize for WorkerState {
 }
 
 // Simplified worker state, used when asking for the worker state
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct DeserializedWorkerState {
+    pub(crate) config: WorkerConfig,
     pub(crate) nb_requests_received: u32,
     pub(crate) nb_requests_being_handled: u32,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::json;
 
-    async fn create_and_run_worker() -> String {
-        let addr = "127.0.0.1:0";
-        let worker = WorkerServer::build(0, addr)
-            .await
-            .expect("Failed to run server");
-        let addr = worker.config.address.clone();
-        tokio::spawn(worker.run());
-        addr
-    }
+    use super::*;
 
     #[tokio::test]
     async fn worker_health_check_returns_200() {
@@ -240,7 +255,7 @@ mod tests {
             .build()
             .expect("Failed to build HTTP client");
 
-        let addr = create_and_run_worker().await;
+        let addr = WorkerServer::create_and_run_worker().await.address;
         let response = http_client
             .get(&format!("http://{}/check-health", addr))
             .send()
@@ -251,12 +266,16 @@ mod tests {
 
     #[tokio::test]
     async fn worker_work_returns_200() {
-        let addr = create_and_run_worker().await;
+        let addr = WorkerServer::create_and_run_worker().await.address;
         let http_client = reqwest::Client::builder()
             .build()
             .expect("Failed to build HTTP client");
+        let json = json!({
+            "duration": 10,
+        });
         let response = http_client
-            .get(&format!("http://{}/work", addr))
+            .post(&format!("http://{}/work", addr))
+            .json(&json)
             .send()
             .await
             .expect("Failed to execute request");
@@ -265,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_state_returns_200_and_correct_state() {
-        let addr = create_and_run_worker().await;
+        let addr = WorkerServer::create_and_run_worker().await.address;
         let http_client = reqwest::Client::builder()
             .build()
             .expect("Failed to build HTTP client");
@@ -284,6 +303,7 @@ mod tests {
                 .expect("Failed to deserialize worker state");
             assert!(state.nb_requests_being_handled < nb_request_sent);
             assert_eq!(state.nb_requests_received, i);
+            assert_eq!(state.config.address, addr);
         }
     }
 }
