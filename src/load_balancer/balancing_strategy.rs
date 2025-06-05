@@ -1,24 +1,25 @@
 use super::server::{LoadBalancerError, LoadBalancerState};
-use crate::worker::{DeserializedWorkerState, WorkerConfig, WorkerId, work};
-use std::{ops::Index, sync::Arc};
+use crate::worker::{DeserializedWorkerState, WorkerConfig, WorkerId};
+use BalancingStrategy::*;
+use color_eyre::eyre::eyre;
+use rand::seq::IndexedRandom;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use strum_macros::EnumIter;
+use tokio::sync::Mutex;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, EnumIter)]
 pub enum BalancingStrategy {
     // TODO: maybe use an atomic
-    RoundRobin(Arc<Mutex<WorkerId>>),
+    RoundRobin(Arc<Mutex<Option<WorkerId>>>),
     LeastConnection,
     #[default]
     Random,
     ResourceBased,
 }
-use BalancingStrategy::*;
-use color_eyre::eyre::eyre;
-use itertools::Itertools;
-use rand::{Rng, seq::IndexedRandom};
-use tokio::sync::Mutex;
 
 impl BalancingStrategy {
-    pub async fn pick_worker(state: LoadBalancerState) -> Result<WorkerConfig, LoadBalancerError> {
+    pub async fn pick_worker(state: &LoadBalancerState) -> Result<WorkerConfig, LoadBalancerError> {
         let LoadBalancerState {
             address: _,
             workers,
@@ -41,9 +42,23 @@ impl BalancingStrategy {
 
 async fn round_robin(
     workers: &Vec<WorkerConfig>,
-    last_worker: &Arc<Mutex<WorkerId>>,
+    last_worker: &Arc<Mutex<Option<WorkerId>>>,
 ) -> Result<WorkerConfig, LoadBalancerError> {
     let last_worker_id = *last_worker.lock().await;
+
+    // If last worker wasn't set before, we take the first from our list
+    if last_worker_id.is_none() {
+        let next_worker = workers
+            .first()
+            .ok_or(LoadBalancerError::InternalError(eyre!(
+                "No available workers"
+            )))?;
+        *last_worker.lock().await = Some(next_worker.id);
+        return Ok(next_worker.clone());
+    }
+
+    // Else we pick the next worker id from our list of workers
+    let last_worker_id = last_worker_id.unwrap();
     let last_worker_index = workers
         .iter()
         .position(|worker| last_worker_id == worker.id)
@@ -53,13 +68,14 @@ async fn round_robin(
     let next_worker = if let Some(worker) = workers.get(last_worker_index + 1) {
         worker
     } else {
+        // If we reach the end of our list of workers we pick the first from the list
         workers
             .first()
             .ok_or(LoadBalancerError::InternalError(eyre!(
                 "No available workers"
             )))?
     };
-    *last_worker.lock().await = next_worker.id;
+    *last_worker.lock().await = Some(next_worker.id);
     Ok(next_worker.clone())
 }
 
@@ -111,6 +127,53 @@ async fn request_worker_state(
     Ok(state)
 }
 
+impl PartialEq for BalancingStrategy {
+    fn eq(&self, other: &Self) -> bool {
+        use BalancingStrategy::*;
+        match (self, other) {
+            (RoundRobin(_), RoundRobin(_)) => true,
+            (LeastConnection, LeastConnection) => true,
+            (Random, Random) => true,
+            (ResourceBased, ResourceBased) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for BalancingStrategy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use BalancingStrategy::*;
+        match self {
+            RoundRobin(_) => serializer.serialize_str("RoundRobin"),
+            LeastConnection => serializer.serialize_str("LeastConnection"),
+            Random => serializer.serialize_str("Random"),
+            ResourceBased => serializer.serialize_str("ResourceBased"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BalancingStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "RoundRobin" => Ok(BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None)))),
+            "LeastConnection" => Ok(BalancingStrategy::LeastConnection),
+            "Random" => Ok(BalancingStrategy::Random),
+            "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
+            _ => Err(serde::de::Error::custom(format!(
+                "Unknown balancing strategy: {}",
+                s
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures::future::join_all;
@@ -119,25 +182,11 @@ mod tests {
     use super::*;
     use crate::worker::{WorkerConfig, WorkerServer};
 
-    // Worker config with random ids
-    fn test_worker_configs(nb_workers: u8) -> Vec<WorkerConfig> {
-        let mut workers = vec![];
-        for _ in 0..nb_workers {
-            let id = rand::rng().random::<u32>();
-
-            workers.push(WorkerConfig {
-                id,
-                address: "127.0.0.1:0".to_string(),
-            });
-        }
-        workers
-    }
-
     #[tokio::test]
     async fn round_robin_picks_next_worker() {
-        let workers = test_worker_configs(5);
-        let init_worker = Arc::new(Mutex::new(workers[0].id));
-        for index in 1..=10 {
+        let workers = WorkerConfig::test_workers(5);
+        let init_worker = Arc::new(Mutex::new(None));
+        for index in 0..10 {
             assert_eq!(
                 round_robin(&workers, &init_worker).await.unwrap().id,
                 workers[index % workers.len()].id
@@ -147,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn random_does_not_create_impossible_value() {
-        let workers = test_worker_configs(5);
+        let workers = WorkerConfig::test_workers(5);
         for _ in 1..=10 {
             let next_worker = random(&workers).await.expect("should not fail");
             assert!(
