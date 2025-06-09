@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     serve::Serve,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
@@ -17,12 +17,12 @@ use uuid::Uuid;
 
 pub struct LoadBalancer {
     #[allow(dead_code)]
-    address: String,
+    pub address: String,
     server: Serve<TcpListener, Router, Router>,
     // We don't need lock here since the only field that could be changed
     // is already behind a lock
     #[allow(dead_code)]
-    state: LoadBalancerState,
+    pub state: LoadBalancerState,
 }
 
 #[derive(Clone, Debug)]
@@ -73,9 +73,9 @@ impl LoadBalancer {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SetBalancingStrategyRequest {
-    strategy: BalancingStrategy,
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SetBalancingStrategyRequest {
+    pub strategy: BalancingStrategy,
 }
 
 #[tracing::instrument(skip_all)]
