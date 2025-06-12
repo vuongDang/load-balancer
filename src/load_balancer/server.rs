@@ -48,7 +48,6 @@ impl LoadBalancer {
             workers,
             strategy: Arc::new(RwLock::new(strategy.unwrap_or_default())),
         };
-        // let server = axum::serve(listener, handle_request.with_state(state));
         let router = LoadBalancer::router(state.clone());
         let server = axum::serve(listener, router);
 
