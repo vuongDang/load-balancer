@@ -13,7 +13,7 @@ static IP: &'static str = "127.0.0.1";
 #[tokio::main]
 async fn main() {
     // Tracing
-    init_tracing().expect("Failed to init tracing");
+    init_tracing("error").expect("Failed to init tracing");
 
     // Start workers
     let mut workers = JoinSet::new();

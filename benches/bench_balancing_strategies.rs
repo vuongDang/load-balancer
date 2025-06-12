@@ -29,7 +29,7 @@ criterion_group!(benches, bench_balancing_strategies);
 criterion_main!(benches);
 
 fn bench_balancing_strategies(c: &mut Criterion) {
-    load_balancer::tracing::init_tracing().expect("Failed to init tracing");
+    load_balancer::tracing::init_tracing("error").expect("Failed to init tracing");
     let nb_requests = NB_REQUESTS;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
