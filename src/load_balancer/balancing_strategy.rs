@@ -1,16 +1,21 @@
 use super::server::{LoadBalancerError, LoadBalancerState};
-use crate::worker::{DeserializedWorkerState, WorkerConfig};
+use crate::{
+    load_balancer::server::WorkerView,
+    worker::{DeserializedWorkerState, WorkerConfig},
+};
 use BalancingStrategy::*;
 use color_eyre::eyre::eyre;
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicUsize;
+use strum_macros::AsRefStr;
 pub(crate) use strum_macros::EnumIter;
 
-#[derive(Default, Debug, EnumIter)]
+#[derive(Default, Debug, EnumIter, AsRefStr)]
 pub enum BalancingStrategy {
     RoundRobin(AtomicUsize),
-    LeastConnection,
+    LeastConnectionWithStatsFromWorkers,
+    LeastConnectionWithInternalStats,
     #[default]
     Random,
     ResourceBased,
@@ -30,7 +35,12 @@ impl BalancingStrategy {
         let chosen_worker = match &*strategy {
             RoundRobin(last_worker) => round_robin(&workers, last_worker).await?,
             Random => random(&workers).await?,
-            LeastConnection => least_connection(&workers).await?,
+            LeastConnectionWithStatsFromWorkers => {
+                least_connection_with_stats_from_workers(&workers).await?
+            }
+            LeastConnectionWithInternalStats => {
+                least_connection_with_internal_stats(&workers).await?
+            }
             ResourceBased => unimplemented!(),
         };
 
@@ -39,27 +49,31 @@ impl BalancingStrategy {
 }
 
 async fn round_robin(
-    workers: &Vec<WorkerConfig>,
+    workers: &Vec<WorkerView>,
     last_worker: &AtomicUsize,
 ) -> Result<WorkerConfig, LoadBalancerError> {
     let last_worker_index =
         last_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize % workers.len();
     let next_worker = &workers[last_worker_index];
-    Ok(next_worker.clone())
+    Ok(next_worker.config.clone())
 }
 
-async fn random(workers: &Vec<WorkerConfig>) -> Result<WorkerConfig, LoadBalancerError> {
+async fn random(workers: &Vec<WorkerView>) -> Result<WorkerConfig, LoadBalancerError> {
     let next_worker = workers
         .choose(&mut rand::rng())
         .ok_or(LoadBalancerError::InternalError(eyre!(
             "List of workers is empty"
         )))?;
-    Ok(next_worker.clone())
+    Ok(next_worker.config.clone())
 }
 
-// Pick the worker who is handling the least number of requests
-async fn least_connection(workers: &Vec<WorkerConfig>) -> Result<WorkerConfig, LoadBalancerError> {
-    let requests = workers.iter().map(request_worker_state);
+// Pick the worker who is handling the least number of requests, with stats from the workers
+async fn least_connection_with_stats_from_workers(
+    workers: &Vec<WorkerView>,
+) -> Result<WorkerConfig, LoadBalancerError> {
+    let requests = workers
+        .iter()
+        .map(|view| request_worker_state(&view.config));
     // Request workers states concurrently
     let requests_response = futures::future::join_all(requests).await;
 
@@ -69,12 +83,37 @@ async fn least_connection(workers: &Vec<WorkerConfig>) -> Result<WorkerConfig, L
         .filter_map(|worker| worker.as_ref().ok());
 
     // Find worker with least request being handled
-    let state_with_min_request_being_handled = worker_states
+    let config_with_min_request_being_handled = worker_states
         .min_by_key(|state| state.nb_requests_being_handled)
         .ok_or(LoadBalancerError::InternalError(eyre!(
             "No stats received from any worker"
         )))?;
-    Ok(state_with_min_request_being_handled.config.clone())
+    Ok(config_with_min_request_being_handled.config.clone())
+}
+
+// Pick the worker who is handling the least number of requests, with stats from the load balancer
+async fn least_connection_with_internal_stats(
+    workers: &[WorkerView],
+) -> Result<WorkerConfig, LoadBalancerError> {
+    let worker_with_min_request_being_handled = workers
+        .iter()
+        .min_by_key(|view| {
+            let nb_requests_handled = view
+                .stats
+                .as_ref()
+                .nb_requests_handled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let nb_requests_sent = view
+                .stats
+                .as_ref()
+                .nb_requests_sent
+                .load(std::sync::atomic::Ordering::Relaxed);
+            nb_requests_sent - nb_requests_handled
+        })
+        .ok_or(LoadBalancerError::InternalError(eyre!(
+            "No workers in config"
+        )))?;
+    Ok(worker_with_min_request_being_handled.config.clone())
 }
 
 // Make a request to a worker about its state
@@ -101,7 +140,8 @@ impl PartialEq for BalancingStrategy {
         use BalancingStrategy::*;
         match (self, other) {
             (RoundRobin(_), RoundRobin(_)) => true,
-            (LeastConnection, LeastConnection) => true,
+            (LeastConnectionWithStatsFromWorkers, LeastConnectionWithStatsFromWorkers) => true,
+            (LeastConnectionWithInternalStats, LeastConnectionWithInternalStats) => true,
             (Random, Random) => true,
             (ResourceBased, ResourceBased) => true,
             _ => false,
@@ -117,7 +157,12 @@ impl Serialize for BalancingStrategy {
         use BalancingStrategy::*;
         match self {
             RoundRobin(_) => serializer.serialize_str("RoundRobin"),
-            LeastConnection => serializer.serialize_str("LeastConnection"),
+            LeastConnectionWithStatsFromWorkers => {
+                serializer.serialize_str("LeastConnectionWithStatsFromWorkers")
+            }
+            LeastConnectionWithInternalStats => {
+                serializer.serialize_str("LeastConnectionWithInternalStats")
+            }
             Random => serializer.serialize_str("Random"),
             ResourceBased => serializer.serialize_str("ResourceBased"),
         }
@@ -132,7 +177,12 @@ impl<'de> Deserialize<'de> for BalancingStrategy {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
             "RoundRobin" => Ok(BalancingStrategy::RoundRobin(AtomicUsize::default())),
-            "LeastConnection" => Ok(BalancingStrategy::LeastConnection),
+            "LeastConnectionWithInternalStats" => {
+                Ok(BalancingStrategy::LeastConnectionWithInternalStats)
+            }
+            "LeastConnectionWithStatsFromWorkers" => {
+                Ok(BalancingStrategy::LeastConnectionWithStatsFromWorkers)
+            }
             "Random" => Ok(BalancingStrategy::Random),
             "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
             _ => Err(serde::de::Error::custom(format!(
@@ -146,43 +196,66 @@ impl<'de> Deserialize<'de> for BalancingStrategy {
 #[cfg(test)]
 mod tests {
     use futures::future::join_all;
+    use itertools::Itertools;
     use serde_json::json;
 
     use super::*;
-    use crate::worker::{WorkerConfig, WorkerServer};
+    use crate::worker::WorkerServer;
 
     #[tokio::test]
     async fn round_robin_picks_next_worker() {
-        let workers = WorkerConfig::test_workers(5);
+        let workers = WorkerView::test_workers(5);
         let glob_index = AtomicUsize::default();
         for index in 0..10 {
             assert_eq!(
                 round_robin(&workers, &glob_index).await.unwrap().id,
-                workers[index % workers.len()].id
+                workers[index % workers.len()].config.id
             );
         }
     }
 
     #[tokio::test]
     async fn random_does_not_create_impossible_value() {
-        let workers = WorkerConfig::test_workers(5);
+        let workers = WorkerView::test_workers(5);
         for _ in 1..=10 {
             let next_worker = random(&workers).await.expect("should not fail");
             assert!(
                 workers
                     .iter()
-                    .find(|worker| **worker == next_worker)
+                    .find(|worker| worker.config.id == next_worker.id)
                     .is_some()
             );
         }
     }
 
     #[tokio::test]
-    async fn least_connection_picks_the_right_worker() {
+    async fn least_connection_with_internal_stats_picks_the_right_worker() {
+        let workers = WorkerView::test_workers(5);
+        for i in 0..=10 {
+            let next_worker = least_connection_with_internal_stats(&workers)
+                .await
+                .expect("should not fail");
+            let index = i % workers.len();
+            println!("{}", index);
+            let expected_worker = workers.get(index).unwrap();
+            assert_eq!(next_worker, expected_worker.config);
+            expected_worker
+                .stats
+                .nb_requests_sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn least_connection_with_worker_state_picks_the_right_worker() {
         const NB_WORKERS: usize = 3;
         let workers =
             (0..NB_WORKERS).map(|_| async { WorkerServer::create_and_run_worker().await });
-        let workers = join_all(workers).await;
+        let worker_configs = join_all(workers).await;
+        let workers = worker_configs
+            .into_iter()
+            .map(WorkerView::new)
+            .collect_vec();
 
         // Send long work to all workers except last one
         for i in 0..(NB_WORKERS - 1) {
@@ -195,7 +268,7 @@ mod tests {
                     "duration": 1000, // we make them work for 1s
                 });
                 let response = http_client
-                    .post(&format!("http://{}/work", worker.address))
+                    .post(&format!("http://{}/work", worker.config.address))
                     .json(&json)
                     .send()
                     .await
@@ -205,9 +278,9 @@ mod tests {
             });
         }
 
-        let next_worker = least_connection(&workers)
+        let next_worker = least_connection_with_stats_from_workers(&workers)
             .await
             .expect("Failed to find next worker");
-        assert_eq!(&next_worker, workers.last().unwrap())
+        assert_eq!(next_worker, workers.last().unwrap().config)
     }
 }

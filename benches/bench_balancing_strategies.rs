@@ -15,6 +15,7 @@ use load_balancer::{
     worker::{self, WorkerConfig, WorkerServer},
 };
 use serde_json::json;
+use strum::IntoEnumIterator;
 use tokio::{sync::Mutex, task::JoinSet};
 
 // Number of worker servers available
@@ -45,84 +46,35 @@ fn bench_balancing_strategies(c: &mut Criterion) {
 
     // Benchmarks where the work duration of requests are constants
     let mut group = c.benchmark_group("Balancing Strategies with constant work duration");
-    group.bench_function("random", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(
-                    lb,
-                    nb_requests,
-                    Some(WORK_DURATION_MS),
-                    BalancingStrategy::Random,
-                )
-            });
-        })
-    });
-    group.bench_function("round robin", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(
-                    lb,
-                    nb_requests,
-                    Some(WORK_DURATION_MS),
-                    BalancingStrategy::RoundRobin(AtomicUsize::default()),
-                )
-            });
-        })
-    });
-    group.bench_function("least connection", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(
-                    lb,
-                    nb_requests,
-                    Some(WORK_DURATION_MS),
-                    BalancingStrategy::LeastConnection,
-                )
+    for strat in BalancingStrategy::iter() {
+        group.bench_function(strat.as_ref(), |b| {
+            b.iter(|| {
+                let lb = (&lb_address).clone();
+                rt.block_on(async move {
+                    send_requests_to_load_balancer(
+                        lb,
+                        nb_requests,
+                        Some(WORK_DURATION_MS),
+                        BalancingStrategy::Random,
+                    )
+                });
             })
-        })
-    });
-
+        });
+    }
     group.finish();
 
     // Benchmarks where the work duration of requests are random
     let mut group = c.benchmark_group("Balancing Strategies with random work duration");
-    group.bench_function("random", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(lb, nb_requests, None, BalancingStrategy::Random)
-            });
-        })
-    });
-    group.bench_function("round robin", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(
-                    lb,
-                    nb_requests,
-                    None,
-                    BalancingStrategy::RoundRobin(AtomicUsize::default()),
-                )
-            });
-        })
-    });
-    group.bench_function("least connection", |b| {
-        b.iter(|| {
-            let lb = (&lb_address).clone();
-            rt.block_on(async move {
-                send_requests_to_load_balancer(
-                    lb,
-                    nb_requests,
-                    None,
-                    BalancingStrategy::LeastConnection,
-                )
+    for strat in BalancingStrategy::iter() {
+        group.bench_function(strat.as_ref(), |b| {
+            b.iter(|| {
+                let lb = (&lb_address).clone();
+                rt.block_on(async move {
+                    send_requests_to_load_balancer(lb, nb_requests, None, BalancingStrategy::Random)
+                });
             })
-        })
-    });
+        });
+    }
 
     group.finish();
 }

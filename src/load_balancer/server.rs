@@ -9,8 +9,9 @@ use axum::{
     routing::{get, post},
     serve::Serve,
 };
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicU64};
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
 use uuid::Uuid;
@@ -25,12 +26,26 @@ pub struct LoadBalancer {
     pub state: LoadBalancerState,
 }
 
+/// View of the worker from the LoadBalancer pov
+#[derive(Debug, Clone)]
+pub struct WorkerView {
+    pub config: WorkerConfig,
+    pub stats: Arc<WorkerStatistics>,
+}
+
+#[derive(Default, Debug)]
+pub struct WorkerStatistics {
+    pub nb_requests_sent: AtomicU64,
+    pub nb_requests_handled: AtomicU64,
+    pub nb_error_status_received: AtomicU64,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadBalancerState {
     #[allow(dead_code)]
     pub(crate) address: String,
     // The worker servers available to the load balancer
-    pub(crate) workers: Vec<WorkerConfig>,
+    pub(crate) workers: Vec<WorkerView>,
     // The balancing strategy being currently employed
     pub(crate) strategy: Arc<RwLock<BalancingStrategy>>,
 }
@@ -43,9 +58,16 @@ impl LoadBalancer {
     ) -> Result<Self, LoadBalancerError> {
         let listener = TcpListener::bind(addr).await?;
         let address = listener.local_addr()?.to_string();
+        let worker_views = workers
+            .into_iter()
+            .map(|config| WorkerView {
+                config,
+                stats: Arc::new(WorkerStatistics::default()),
+            })
+            .collect_vec();
         let state = LoadBalancerState {
             address: address.clone(),
-            workers,
+            workers: worker_views,
             strategy: Arc::new(RwLock::new(strategy.unwrap_or_default())),
         };
         let router = LoadBalancer::router(state.clone());
@@ -171,6 +193,27 @@ impl LoadBalancer {
         let state = load_balancer.state.clone();
         let _ = tokio::spawn(load_balancer.run());
         Ok(state)
+    }
+}
+
+impl WorkerView {
+    #[cfg(test)]
+    pub(crate) fn test_workers(nb_workers: u8) -> Vec<WorkerView> {
+        let mut workers = vec![];
+        for _ in 0..nb_workers {
+            workers.push(WorkerView {
+                config: WorkerConfig::test_config(),
+                stats: Arc::new(WorkerStatistics::default()),
+            });
+        }
+        workers
+    }
+
+    pub fn new(config: WorkerConfig) -> Self {
+        WorkerView {
+            config,
+            stats: Arc::new(WorkerStatistics::default()),
+        }
     }
 }
 
