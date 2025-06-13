@@ -1,6 +1,9 @@
 #![allow(unused)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, atomic::AtomicUsize},
+    time::Duration,
+};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::future::join_all;
@@ -63,7 +66,7 @@ fn bench_balancing_strategies(c: &mut Criterion) {
                     lb,
                     nb_requests,
                     Some(WORK_DURATION_MS),
-                    BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None))),
+                    BalancingStrategy::RoundRobin(AtomicUsize::default()),
                 )
             });
         })
@@ -102,7 +105,7 @@ fn bench_balancing_strategies(c: &mut Criterion) {
                     lb,
                     nb_requests,
                     None,
-                    BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None))),
+                    BalancingStrategy::RoundRobin(AtomicUsize::default()),
                 )
             });
         })

@@ -1,17 +1,15 @@
 use super::server::{LoadBalancerError, LoadBalancerState};
-use crate::worker::{DeserializedWorkerState, WorkerConfig, WorkerId};
+use crate::worker::{DeserializedWorkerState, WorkerConfig};
 use BalancingStrategy::*;
 use color_eyre::eyre::eyre;
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use strum_macros::EnumIter;
-use tokio::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+pub(crate) use strum_macros::EnumIter;
 
 #[derive(Default, Debug, EnumIter)]
 pub enum BalancingStrategy {
-    // TODO: maybe use an atomic
-    RoundRobin(Arc<Mutex<Option<WorkerId>>>),
+    RoundRobin(AtomicUsize),
     LeastConnection,
     #[default]
     Random,
@@ -42,40 +40,11 @@ impl BalancingStrategy {
 
 async fn round_robin(
     workers: &Vec<WorkerConfig>,
-    last_worker: &Arc<Mutex<Option<WorkerId>>>,
+    last_worker: &AtomicUsize,
 ) -> Result<WorkerConfig, LoadBalancerError> {
-    let last_worker_id = *last_worker.lock().await;
-
-    // If last worker wasn't set before, we take the first from our list
-    if last_worker_id.is_none() {
-        let next_worker = workers
-            .first()
-            .ok_or(LoadBalancerError::InternalError(eyre!(
-                "No available workers"
-            )))?;
-        *last_worker.lock().await = Some(next_worker.id);
-        return Ok(next_worker.clone());
-    }
-
-    // Else we pick the next worker id from our list of workers
-    let last_worker_id = last_worker_id.unwrap();
-    let last_worker_index = workers
-        .iter()
-        .position(|worker| last_worker_id == worker.id)
-        .ok_or(LoadBalancerError::InternalError(eyre!(
-            "Last worker id is not in the available workers"
-        )))?;
-    let next_worker = if let Some(worker) = workers.get(last_worker_index + 1) {
-        worker
-    } else {
-        // If we reach the end of our list of workers we pick the first from the list
-        workers
-            .first()
-            .ok_or(LoadBalancerError::InternalError(eyre!(
-                "No available workers"
-            )))?
-    };
-    *last_worker.lock().await = Some(next_worker.id);
+    let last_worker_index =
+        last_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize % workers.len();
+    let next_worker = &workers[last_worker_index];
     Ok(next_worker.clone())
 }
 
@@ -162,7 +131,7 @@ impl<'de> Deserialize<'de> for BalancingStrategy {
     {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
-            "RoundRobin" => Ok(BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None)))),
+            "RoundRobin" => Ok(BalancingStrategy::RoundRobin(AtomicUsize::default())),
             "LeastConnection" => Ok(BalancingStrategy::LeastConnection),
             "Random" => Ok(BalancingStrategy::Random),
             "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
@@ -185,10 +154,10 @@ mod tests {
     #[tokio::test]
     async fn round_robin_picks_next_worker() {
         let workers = WorkerConfig::test_workers(5);
-        let init_worker = Arc::new(Mutex::new(None));
+        let glob_index = AtomicUsize::default();
         for index in 0..10 {
             assert_eq!(
-                round_robin(&workers, &init_worker).await.unwrap().id,
+                round_robin(&workers, &glob_index).await.unwrap().id,
                 workers[index % workers.len()].id
             );
         }

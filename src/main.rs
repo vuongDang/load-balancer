@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use load_balancer::{
     load_balancer::{balancing_strategy::BalancingStrategy, server::LoadBalancer},
     tracing::init_tracing,
     worker::WorkerServer,
 };
-use tokio::{sync::Mutex, task::JoinSet};
+use tokio::task::JoinSet;
 
 static NB_WORKERS: u32 = 1;
 static IP: &'static str = "127.0.0.1";
@@ -33,7 +33,7 @@ async fn main() {
     let lb = LoadBalancer::build(
         &format!("{}:3000", IP),
         workers_config,
-        Some(BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None)))),
+        Some(BalancingStrategy::RoundRobin(AtomicUsize::default())),
     )
     .await
     .expect("Failed to start load balander");
