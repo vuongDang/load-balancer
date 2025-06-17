@@ -11,22 +11,28 @@ use std::sync::atomic::AtomicUsize;
 use strum_macros::AsRefStr;
 pub(crate) use strum_macros::EnumIter;
 
-#[derive(Default, Debug, EnumIter, AsRefStr)]
+#[derive(Debug, EnumIter, AsRefStr)]
 pub enum BalancingStrategy {
     RoundRobin(AtomicUsize),
     LeastConnectionWithStatsFromWorkers,
     LeastConnectionWithInternalStats,
-    #[default]
     Random,
     ResourceBased,
 }
 
+impl Default for BalancingStrategy {
+    fn default() -> Self {
+        RoundRobin(AtomicUsize::default())
+    }
+}
+
 impl BalancingStrategy {
-    pub async fn pick_worker(state: &LoadBalancerState) -> Result<WorkerConfig, LoadBalancerError> {
+    pub async fn pick_worker(state: &LoadBalancerState) -> Result<&WorkerView, LoadBalancerError> {
         let LoadBalancerState {
             address: _,
             workers,
             strategy,
+            stats: _,
         } = state;
 
         let strategy = strategy.read().await;
@@ -48,29 +54,29 @@ impl BalancingStrategy {
     }
 }
 
-async fn round_robin(
-    workers: &Vec<WorkerView>,
+async fn round_robin<'a>(
+    workers: &'a Vec<WorkerView>,
     last_worker: &AtomicUsize,
-) -> Result<WorkerConfig, LoadBalancerError> {
+) -> Result<&'a WorkerView, LoadBalancerError> {
     let last_worker_index =
         last_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize % workers.len();
     let next_worker = &workers[last_worker_index];
-    Ok(next_worker.config.clone())
+    Ok(next_worker)
 }
 
-async fn random(workers: &Vec<WorkerView>) -> Result<WorkerConfig, LoadBalancerError> {
+async fn random(workers: &Vec<WorkerView>) -> Result<&WorkerView, LoadBalancerError> {
     let next_worker = workers
         .choose(&mut rand::rng())
         .ok_or(LoadBalancerError::InternalError(eyre!(
             "List of workers is empty"
         )))?;
-    Ok(next_worker.config.clone())
+    Ok(next_worker)
 }
 
 // Pick the worker who is handling the least number of requests, with stats from the workers
 async fn least_connection_with_stats_from_workers(
     workers: &Vec<WorkerView>,
-) -> Result<WorkerConfig, LoadBalancerError> {
+) -> Result<&WorkerView, LoadBalancerError> {
     let requests = workers
         .iter()
         .map(|view| request_worker_state(&view.config));
@@ -83,18 +89,26 @@ async fn least_connection_with_stats_from_workers(
         .filter_map(|worker| worker.as_ref().ok());
 
     // Find worker with least request being handled
-    let config_with_min_request_being_handled = worker_states
+    let worker_id_with_min_request_being_handled = worker_states
         .min_by_key(|state| state.nb_requests_being_handled)
         .ok_or(LoadBalancerError::InternalError(eyre!(
             "No stats received from any worker"
-        )))?;
-    Ok(config_with_min_request_being_handled.config.clone())
+        )))?
+        .config
+        .id;
+
+    Ok(workers
+        .iter()
+        .find(|worker| worker.config.id == worker_id_with_min_request_being_handled)
+        .ok_or(LoadBalancerError::InternalError(eyre!(
+            "Worker not found in the load balancer config"
+        )))?)
 }
 
 // Pick the worker who is handling the least number of requests, with stats from the load balancer
 async fn least_connection_with_internal_stats(
     workers: &[WorkerView],
-) -> Result<WorkerConfig, LoadBalancerError> {
+) -> Result<&WorkerView, LoadBalancerError> {
     let worker_with_min_request_being_handled = workers
         .iter()
         .min_by_key(|view| {
@@ -113,7 +127,7 @@ async fn least_connection_with_internal_stats(
         .ok_or(LoadBalancerError::InternalError(eyre!(
             "No workers in config"
         )))?;
-    Ok(worker_with_min_request_being_handled.config.clone())
+    Ok(worker_with_min_request_being_handled)
 }
 
 // Make a request to a worker about its state
@@ -208,7 +222,7 @@ mod tests {
         let glob_index = AtomicUsize::default();
         for index in 0..10 {
             assert_eq!(
-                round_robin(&workers, &glob_index).await.unwrap().id,
+                round_robin(&workers, &glob_index).await.unwrap().config.id,
                 workers[index % workers.len()].config.id
             );
         }
@@ -222,7 +236,7 @@ mod tests {
             assert!(
                 workers
                     .iter()
-                    .find(|worker| worker.config.id == next_worker.id)
+                    .find(|worker| worker.config == next_worker.config)
                     .is_some()
             );
         }
@@ -238,7 +252,7 @@ mod tests {
             let index = i % workers.len();
             println!("{}", index);
             let expected_worker = workers.get(index).unwrap();
-            assert_eq!(next_worker, expected_worker.config);
+            assert_eq!(next_worker.config, expected_worker.config);
             expected_worker
                 .stats
                 .nb_requests_sent
@@ -281,6 +295,6 @@ mod tests {
         let next_worker = least_connection_with_stats_from_workers(&workers)
             .await
             .expect("Failed to find next worker");
-        assert_eq!(next_worker, workers.last().unwrap().config)
+        assert_eq!(next_worker.config, workers.last().unwrap().config)
     }
 }

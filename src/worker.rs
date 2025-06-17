@@ -76,8 +76,13 @@ impl WorkerServer {
         let server = axum::serve(listener, router);
         Ok(WorkerServer { config, server })
     }
+
     pub async fn run(self) -> Result<(), std::io::Error> {
-        tracing::info!("Starting worker on {}", self.config.address);
+        tracing::info!(
+            "Starting worker [{}] on {}",
+            self.config.id,
+            self.config.address
+        );
         self.server.await
     }
 
