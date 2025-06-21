@@ -1,5 +1,7 @@
 use crate::load_balancer::balancing_strategy::BalancingStrategy;
+use crate::load_balancer::metrics::{LoadBalancerStats, WorkerStatistics};
 use crate::worker::WorkerConfig;
+use axum::debug_handler;
 use axum::{
     Json, Router,
     body::Body,
@@ -9,10 +11,12 @@ use axum::{
     routing::{get, post},
     serve::Serve,
 };
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
 pub struct LoadBalancer {
@@ -25,14 +29,22 @@ pub struct LoadBalancer {
     pub state: LoadBalancerState,
 }
 
+/// View of the worker from the LoadBalancer pov
+#[derive(Debug, Clone)]
+pub struct WorkerView {
+    pub config: WorkerConfig,
+    pub stats: Arc<WorkerStatistics>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadBalancerState {
     #[allow(dead_code)]
     pub(crate) address: String,
     // The worker servers available to the load balancer
-    pub(crate) workers: Vec<WorkerConfig>,
+    pub(crate) workers: Vec<WorkerView>,
     // The balancing strategy being currently employed
     pub(crate) strategy: Arc<RwLock<BalancingStrategy>>,
+    pub(crate) stats: Arc<LoadBalancerStats>,
 }
 
 impl LoadBalancer {
@@ -43,11 +55,13 @@ impl LoadBalancer {
     ) -> Result<Self, LoadBalancerError> {
         let listener = TcpListener::bind(addr).await?;
         let address = listener.local_addr()?.to_string();
-        let state = LoadBalancerState {
-            address: address.clone(),
-            workers,
-            strategy: Arc::new(RwLock::new(strategy.unwrap_or_default())),
-        };
+        let address_clone = address.clone();
+        let workers = workers
+            .into_iter()
+            .map(|config| WorkerView::new(config))
+            .collect_vec();
+
+        let state = LoadBalancerState::new(address_clone, workers, strategy.unwrap_or_default());
         let router = LoadBalancer::router(state.clone());
         let server = axum::serve(listener, router);
 
@@ -72,6 +86,18 @@ impl LoadBalancer {
     }
 }
 
+impl LoadBalancerState {
+    pub fn new(address: String, workers: Vec<WorkerView>, strategy: BalancingStrategy) -> Self {
+        let nb_workers = workers.len();
+        LoadBalancerState {
+            address,
+            workers,
+            strategy: Arc::new(RwLock::new(strategy)),
+            stats: Arc::new(LoadBalancerStats::new(nb_workers)),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SetBalancingStrategyRequest {
     pub strategy: BalancingStrategy,
@@ -89,32 +115,74 @@ pub async fn set_balancing_strategy(
 
 /// Pick a worker server depending on the balancing strategy chosen and redirect the request to the worker
 #[tracing::instrument(skip_all)]
+#[debug_handler]
 pub async fn transfer_request(
     State(state): State<LoadBalancerState>,
     request: Request<Body>,
 ) -> Result<impl IntoResponse, LoadBalancerError> {
+    state
+        .stats
+        .nb_requests_received
+        .fetch_add(1, Ordering::Relaxed);
+
     let request_id = Uuid::new_v4();
-    tracing::trace!("[{}] received", request_id);
 
     let chosen_worker = BalancingStrategy::pick_worker(&state).await?;
-    tracing::trace!("[{}] chosen worker {}", request_id, chosen_worker.id);
+    trace!("[{}] chosen worker {}", request_id, chosen_worker.config.id);
 
     // Send request to chosen worker
-    let request = convert_axum_request_to_reqwest_request(request, chosen_worker);
-    tracing::trace!("[{}] request sent {:?}", request_id, request);
+    let request = convert_axum_request_to_reqwest_request(request, &chosen_worker.config);
+    trace!("[{}] request sent {:?}", request_id, request);
 
-    let response = reqwest::Client::new()
-        .execute(request)
-        .await
-        .map_err(LoadBalancerError::WorkerError)?;
-    tracing::trace!("[{}] response received {:?}", request_id, response);
+    chosen_worker
+        .stats
+        .nb_requests_sent
+        .fetch_add(1, Ordering::Relaxed);
+
+    let response = reqwest::Client::new().execute(request).await;
+
+    chosen_worker
+        .stats
+        .nb_requests_handled
+        .fetch_add(1, Ordering::Relaxed);
+
+    // The load balancer fails to send the request
+    if response.is_err() {
+        error!("[{}] response received {:?}", request_id, response);
+        state.stats.nb_errors.fetch_add(1, Ordering::Relaxed);
+        chosen_worker
+            .stats
+            .nb_error_status_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let response = response.map_err(|e| LoadBalancerError::InternalError(e.into()))?;
+
+    // The load balancer has encountered an error
+    if response.status().is_client_error() {
+        error!("[{}] response received {:?}", request_id, response);
+        state.stats.nb_errors.fetch_add(1, Ordering::Relaxed);
+    // Worker server returns an error, increment the worker error stats
+    } else if response.status().is_server_error() {
+        info!(
+            "[{}] Worker server encountered an error: {:?}",
+            request_id, response
+        );
+        chosen_worker
+            .stats
+            .nb_error_status_received
+            .fetch_add(1, Ordering::Relaxed);
+    // The request was successful
+    } else if response.status().is_success() {
+        trace!("[{}] response received {:?}", request_id, response);
+    }
+    state.stats.recompute_weight(&state).await?;
     convert_reqwest_response_to_axum_response(response)
 }
 
 // Change uri to chosen worker and produces `reqwuest::Request`
 fn convert_axum_request_to_reqwest_request(
     mut axum_req: Request<Body>,
-    worker: WorkerConfig,
+    worker: &WorkerConfig,
 ) -> reqwest::Request {
     // Create a new uri with the worker authority
     let uri = axum_req.uri_mut();
@@ -163,7 +231,7 @@ impl LoadBalancer {
     /// When we need control on the strategy from the outside
     /// Meant to be used for tests
     #[cfg(test)]
-    async fn test_run(
+    pub async fn test_run(
         addr: &str,
         workers: Vec<WorkerConfig>,
     ) -> Result<LoadBalancerState, LoadBalancerError> {
@@ -171,6 +239,43 @@ impl LoadBalancer {
         let state = load_balancer.state.clone();
         let _ = tokio::spawn(load_balancer.run());
         Ok(state)
+    }
+
+    /// When we need control on the strategy from the outside
+    /// Meant to be used for tests
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn test_run_with_view(
+        addr: &str,
+        workers: Vec<WorkerView>,
+    ) -> Result<LoadBalancerState, LoadBalancerError> {
+        let load_balancer =
+            LoadBalancer::build(addr, workers.into_iter().map(|w| w.config).collect(), None)
+                .await?;
+        let state = load_balancer.state.clone();
+        let _ = tokio::spawn(load_balancer.run());
+        Ok(state)
+    }
+}
+
+impl WorkerView {
+    #[cfg(test)]
+    pub(crate) fn test_workers(nb_workers: u8) -> Vec<WorkerView> {
+        let mut workers = vec![];
+        for _ in 0..nb_workers {
+            workers.push(WorkerView {
+                config: WorkerConfig::test_config(),
+                stats: Arc::new(WorkerStatistics::default()),
+            });
+        }
+        workers
+    }
+
+    pub fn new(config: WorkerConfig) -> Self {
+        WorkerView {
+            config,
+            stats: Arc::new(WorkerStatistics::default()),
+        }
     }
 }
 

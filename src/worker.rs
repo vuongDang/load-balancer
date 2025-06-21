@@ -76,8 +76,13 @@ impl WorkerServer {
         let server = axum::serve(listener, router);
         Ok(WorkerServer { config, server })
     }
+
     pub async fn run(self) -> Result<(), std::io::Error> {
-        tracing::info!("Starting worker on {}", self.config.address);
+        tracing::info!(
+            "Starting worker [{}] on {}",
+            self.config.id,
+            self.config.address
+        );
         self.server.await
     }
 
@@ -250,14 +255,18 @@ impl WorkerConfig {
     pub(crate) fn test_workers(nb_workers: u8) -> Vec<WorkerConfig> {
         let mut workers = vec![];
         for _ in 0..nb_workers {
-            let id = rand::rng().random::<u32>();
-
-            workers.push(WorkerConfig {
-                id,
-                address: "127.0.0.1:0".to_string(),
-            });
+            workers.push(WorkerConfig::test_config());
         }
         workers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_config() -> WorkerConfig {
+        let id = rand::rng().random::<u32>();
+        WorkerConfig {
+            id,
+            address: "127.0.0.1:0".to_string(),
+        }
     }
 }
 
