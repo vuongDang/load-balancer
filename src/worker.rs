@@ -34,6 +34,7 @@ pub struct WorkerServer {
 }
 
 pub type WorkerId = u32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerConfig {
     pub id: WorkerId,
@@ -112,8 +113,8 @@ pub async fn work(
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct WorkRequest {
-    duration: u64,
+pub(crate) struct WorkRequest {
+    pub(crate) duration: u64,
 }
 
 pub async fn get_worker_state(
@@ -241,6 +242,23 @@ pub(crate) struct DeserializedWorkerState {
     pub(crate) config: WorkerConfig,
     pub(crate) nb_requests_received: u32,
     pub(crate) nb_requests_being_handled: u32,
+}
+
+impl WorkerConfig {
+    // Worker config with random ids
+    #[cfg(test)]
+    pub(crate) fn test_workers(nb_workers: u8) -> Vec<WorkerConfig> {
+        let mut workers = vec![];
+        for _ in 0..nb_workers {
+            let id = rand::rng().random::<u32>();
+
+            workers.push(WorkerConfig {
+                id,
+                address: "127.0.0.1:0".to_string(),
+            });
+        }
+        workers
+    }
 }
 
 #[cfg(test)]

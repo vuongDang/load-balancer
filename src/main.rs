@@ -13,7 +13,7 @@ static IP: &'static str = "127.0.0.1";
 #[tokio::main]
 async fn main() {
     // Tracing
-    init_tracing().expect("Failed to init tracing");
+    init_tracing("error").expect("Failed to init tracing");
 
     // Start workers
     let mut workers = JoinSet::new();
@@ -30,12 +30,13 @@ async fn main() {
     }
 
     // Start load balancer
-    LoadBalancer::run(
+    let lb = LoadBalancer::build(
         &format!("{}:3000", IP),
         workers_config,
-        Some(BalancingStrategy::RoundRobin(Arc::new(Mutex::new(0)))),
+        Some(BalancingStrategy::RoundRobin(Arc::new(Mutex::new(None)))),
     )
     .await
-    .expect("Failed to start load balander")
+    .expect("Failed to start load balander");
+    let _ = lb.run().await;
     // workers.join_all().await;
 }
