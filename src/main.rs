@@ -12,7 +12,7 @@ async fn main() {
     init_tracing("error").expect("Failed to init tracing");
 
     // Start workers
-    let mut workers = JoinSet::new();
+    // let mut workers = JoinSet::new();
     let mut workers_config = Vec::with_capacity(NB_WORKERS as usize);
     for id in 0..NB_WORKERS {
         let addr = format!("{}:0", IP);
@@ -20,9 +20,9 @@ async fn main() {
             .await
             .expect("Failed to run server");
         workers_config.push(worker.config.clone());
-        workers.spawn(async move {
-            worker.run().await.expect("Failed to run the app");
-        });
+        // workers.spawn(async move {
+        //     worker.run().await.expect("Failed to run the app");
+        // });
     }
 
     // Start load balancer

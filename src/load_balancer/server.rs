@@ -1,6 +1,7 @@
 use crate::load_balancer::balancing_strategy::BalancingStrategy;
 use crate::load_balancer::metrics::{LoadBalancerStats, WorkerStatistics};
 use crate::worker::WorkerConfig;
+use axum::debug_handler;
 use axum::{
     Json, Router,
     body::Body,
@@ -114,6 +115,7 @@ pub async fn set_balancing_strategy(
 
 /// Pick a worker server depending on the balancing strategy chosen and redirect the request to the worker
 #[tracing::instrument(skip_all)]
+#[debug_handler]
 pub async fn transfer_request(
     State(state): State<LoadBalancerState>,
     request: Request<Body>,
@@ -173,6 +175,7 @@ pub async fn transfer_request(
     } else if response.status().is_success() {
         trace!("[{}] response received {:?}", request_id, response);
     }
+    state.stats.recompute_weight(&state).await?;
     convert_reqwest_response_to_axum_response(response)
 }
 

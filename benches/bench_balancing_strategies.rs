@@ -159,6 +159,6 @@ fn strat_copy(strat: &BalancingStrategy) -> BalancingStrategy {
         }
         BalancingStrategy::RoundRobin(_) => BalancingStrategy::RoundRobin(AtomicUsize::default()),
         BalancingStrategy::ResourceBased => BalancingStrategy::ResourceBased,
-        BalancingStrategy::WeightedWorkers => BalancingStrategy::WeightedWorkers,
+        BalancingStrategy::WeightedWorkersByErrors => BalancingStrategy::WeightedWorkersByErrors,
     }
 }

@@ -5,20 +5,20 @@ use crate::{
 };
 use BalancingStrategy::*;
 use color_eyre::eyre::eyre;
-use rand::{distr::Distribution, seq::IndexedRandom};
+use rand::{SeedableRng, distr::Distribution, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicUsize;
 use strum_macros::AsRefStr;
 pub(crate) use strum_macros::EnumIter;
 
-#[derive(Debug, EnumIter, AsRefStr)]
+#[derive(Debug, EnumIter, AsRefStr, Serialize, Deserialize)]
 pub enum BalancingStrategy {
     RoundRobin(AtomicUsize),
     LeastConnectionWithStatsFromWorkers,
     LeastConnectionWithInternalStats,
     Random,
     ResourceBased,
-    WeightedWorkers,
+    WeightedWorkersByErrors,
 }
 
 impl Default for BalancingStrategy {
@@ -48,7 +48,7 @@ impl BalancingStrategy {
             LeastConnectionWithInternalStats => {
                 least_connection_with_internal_stats(&workers).await?
             }
-            WeightedWorkers => weighted_workers(state, &workers).await?,
+            WeightedWorkersByErrors => weighted_workers(state, &workers).await?,
             ResourceBased => unimplemented!(),
         };
 
@@ -138,8 +138,8 @@ async fn weighted_workers<'a>(
     workers: &'a [WorkerView],
 ) -> Result<&'a WorkerView, LoadBalancerError> {
     // TODO should I create a new seed each time?
-    let mut rng = rand::rng();
-    let index_of_next_worker = lb_state.stats.workers_weight.sample(&mut rng);
+    let mut rng = rand::rngs::SmallRng::from_os_rng();
+    let index_of_next_worker = lb_state.stats.workers_weight.read().await.sample(&mut rng);
     workers
         .get(index_of_next_worker)
         .ok_or(LoadBalancerError::InternalError(eyre!(
@@ -175,45 +175,45 @@ impl PartialEq for BalancingStrategy {
             (LeastConnectionWithInternalStats, LeastConnectionWithInternalStats) => true,
             (Random, Random) => true,
             (ResourceBased, ResourceBased) => true,
-            (WeightedWorkers, WeightedWorkers) => true,
+            (WeightedWorkersByErrors, WeightedWorkersByErrors) => true,
             _ => false,
         }
     }
 }
 
-impl Serialize for BalancingStrategy {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for BalancingStrategy {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "RoundRobin" => Ok(BalancingStrategy::RoundRobin(AtomicUsize::default())),
-            "LeastConnectionWithInternalStats" => {
-                Ok(BalancingStrategy::LeastConnectionWithInternalStats)
-            }
-            "LeastConnectionWithStatsFromWorkers" => {
-                Ok(BalancingStrategy::LeastConnectionWithStatsFromWorkers)
-            }
-            "Random" => Ok(BalancingStrategy::Random),
-            "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
-            "WeightedWorkers" => Ok(BalancingStrategy::WeightedWorkers),
-            _ => Err(serde::de::Error::custom(format!(
-                "Unknown balancing strategy: {}",
-                s
-            ))),
-        }
-    }
-}
+// impl Serialize for BalancingStrategy {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         serializer.serialize_str(self.as_ref())
+//     }
+// }
+//
+// impl<'de> Deserialize<'de> for BalancingStrategy {
+//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+//     where
+//         D: serde::Deserializer<'de>,
+//     {
+//         let s = String::deserialize(deserializer)?;
+//         match s.as_str() {
+//             "RoundRobin" => Ok(BalancingStrategy::RoundRobin(AtomicUsize::default())),
+//             "LeastConnectionWithInternalStats" => {
+//                 Ok(BalancingStrategy::LeastConnectionWithInternalStats)
+//             }
+//             "LeastConnectionWithStatsFromWorkers" => {
+//                 Ok(BalancingStrategy::LeastConnectionWithStatsFromWorkers)
+//             }
+//             "Random" => Ok(BalancingStrategy::Random),
+//             "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
+//             "WeightedWorkersByErrors" => Ok(BalancingStrategy::WeightedWorkersByErrors),
+//             _ => Err(serde::de::Error::custom(format!(
+//                 "Unknown balancing strategy: {}",
+//                 s
+//             ))),
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +223,7 @@ mod tests {
     use itertools::Itertools;
     use rand::distr::weighted::WeightedIndex;
     use serde_json::json;
+    use tokio::sync::RwLock;
 
     use super::*;
     use crate::{load_balancer::metrics::LoadBalancerStats, worker::WorkerServer};
@@ -316,7 +317,7 @@ mod tests {
         let mut lb_state = LoadBalancerState::new(
             "127.0.0.1".to_owned(),
             workers.clone(),
-            BalancingStrategy::WeightedWorkers,
+            BalancingStrategy::WeightedWorkersByErrors,
         );
 
         // Picked worker exists in the config
@@ -334,12 +335,12 @@ mod tests {
 
         // Weigthed distribution works correctly
         // Only first index has some weight
-        let mut weights = [0u32, 0, 0, 0, 0];
+        let mut weights = [0u64, 0, 0, 0, 0];
         for i in 0..nb_workers as usize {
             weights.fill(0);
             weights[i] = 1;
             let mut stats = LoadBalancerStats::new(nb_workers as usize);
-            stats.workers_weight = WeightedIndex::new(weights).unwrap();
+            stats.workers_weight = RwLock::new(WeightedIndex::new(weights).unwrap());
             lb_state.stats = Arc::new(stats);
             let next_worker = weighted_workers(&lb_state, &workers)
                 .await
@@ -347,10 +348,10 @@ mod tests {
             assert_eq!(next_worker.config, workers[i].config);
         }
 
-        let weights = [1u32, 0, 1, 0, 1];
+        let weights = [1u64, 0, 1, 0, 1];
         for _ in 0..nb_workers as usize {
             let mut stats = LoadBalancerStats::new(nb_workers as usize);
-            stats.workers_weight = WeightedIndex::new(weights).unwrap();
+            stats.workers_weight = RwLock::new(WeightedIndex::new(weights).unwrap());
             lb_state.stats = Arc::new(stats);
             let next_worker = weighted_workers(&lb_state, &workers)
                 .await

@@ -1,16 +1,18 @@
-//! All the metrics collected by the load balancer
-//! and also the statistics computed
-
-use crate::worker::WorkerId;
+use crate::load_balancer::{
+    balancing_strategy::BalancingStrategy,
+    server::{LoadBalancerError, LoadBalancerState},
+};
+use itertools::Itertools;
 use rand::distr::weighted::WeightedIndex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::RwLock;
 
 #[derive(Debug)]
 pub struct LoadBalancerStats {
     pub(crate) nb_requests_received: AtomicU64,
     pub(crate) nb_errors: AtomicU64,
     // Weight given to each worker
-    pub(crate) workers_weight: WeightedIndex<WorkerId>,
+    pub(crate) workers_weight: RwLock<WeightedIndex<u64>>,
 }
 
 #[derive(Default, Debug)]
@@ -27,14 +29,59 @@ impl LoadBalancerStats {
         LoadBalancerStats {
             nb_requests_received: AtomicU64::default(),
             nb_errors: AtomicU64::default(),
-            workers_weight: WeightedIndex::new(weights)
-                .expect("Failed to create default worker weights distribution"),
+            workers_weight: RwLock::new(
+                WeightedIndex::new(weights)
+                    .expect("Failed to create default worker weights distribution"),
+            ),
         }
+    }
+
+    pub async fn recompute_weight(
+        &self,
+        state: &LoadBalancerState,
+    ) -> Result<(), LoadBalancerError> {
+        let strat = state.strategy.read().await;
+        match *strat {
+            BalancingStrategy::WeightedWorkersByErrors => {
+                // Recompute weights every 100 requests
+                if self.nb_requests_received.load(Ordering::Relaxed) % 100 == 0 {
+                    // If a worker has a big error ratio its weight is going to be smaller
+                    let weights = state
+                        .workers
+                        .iter()
+                        .map(|worker| {
+                            let nb_requests =
+                                worker.stats.nb_requests_handled.load(Ordering::Relaxed);
+                            let nb_errors = worker
+                                .stats
+                                .nb_error_status_received
+                                .load(Ordering::Relaxed);
+
+                            // If no requests have been handled yet give the default weight 1
+                            if nb_requests == 0 {
+                                100
+                            } else {
+                                // (the + 1 is to avoid being at zero and never receiveing a request anymore, especially if fail at first request)
+                                (nb_requests - nb_errors) / nb_requests * 100 + 1
+                            }
+                        })
+                        .collect_vec();
+                    let mut write_lock = self.workers_weight.write().await;
+                    let weights = WeightedIndex::new(weights)
+                        .map_err(|e| LoadBalancerError::InternalError(e.into()))?;
+                    *write_lock = weights;
+                }
+            }
+            // Do not recompute weight for other strategies
+            _ => {}
+        }
+        Result::<(), LoadBalancerError>::Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::{sync::atomic::Ordering, time::Duration};
 
     use futures::future::join_all;
@@ -42,7 +89,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        load_balancer::server::{LoadBalancer, WorkerView},
+        load_balancer::server::{LoadBalancer, LoadBalancerState, WorkerView},
         worker::{WorkRequest, WorkerServer},
     };
 
@@ -181,5 +228,74 @@ mod tests {
             nb_workers as u64 * 2
         );
         assert_eq!(lb_stats.nb_errors.load(Ordering::Relaxed), 0);
+    }
+
+    // Conditions
+    // - the bigger the error ratio is, the less weight a worker should have
+    // - workers with the similar error ratio should have similar weight
+    // - weight should never be 0
+    #[tokio::test]
+    async fn weighted_workers_stats_are_computed_correctly() {
+        let nb_workers = 5;
+        let workers = WorkerView::test_workers(nb_workers);
+        let worker_stats = workers.iter().map(|view| view.stats.clone()).collect_vec();
+        let lb_state = LoadBalancerState::new(
+            "127.0.0.1".to_owned(),
+            workers.clone(),
+            BalancingStrategy::WeightedWorkersByErrors,
+        );
+
+        // With 0 requests all weights should be equal
+        lb_state.stats.recompute_weight(&lb_state).await.unwrap();
+        let weights = lb_state.stats.workers_weight.read().await;
+        assert!(weights.weights().count() == nb_workers as usize);
+        assert!(weights.weights().all_equal());
+        assert!(weights.weights().all(|weight| weight != 0));
+        drop(weights);
+
+        // Give all workers the same stats, all weights should be equal
+        worker_stats
+            .iter()
+            .map(|stats| {
+                stats.nb_requests_handled.store(100, Ordering::Relaxed);
+                stats.nb_error_status_received.store(50, Ordering::Relaxed);
+            })
+            .collect_vec();
+        lb_state.stats.recompute_weight(&lb_state).await.unwrap();
+        let weights = lb_state.stats.workers_weight.read().await;
+        assert!(weights.weights().count() == nb_workers as usize);
+        assert!(weights.weights().all_equal());
+        assert!(weights.weights().all(|weight| weight != 0));
+        drop(weights);
+
+        // Give all workers the same error ratio, all weights should be equal
+        for (i, stats) in worker_stats.iter().enumerate() {
+            stats
+                .nb_requests_handled
+                .store((i + 1) as u64 * 100, Ordering::Relaxed);
+            stats
+                .nb_error_status_received
+                .store((i + 1) as u64 * 50, Ordering::Relaxed);
+        }
+        lb_state.stats.recompute_weight(&lb_state).await.unwrap();
+        let weights = lb_state.stats.workers_weight.read().await;
+        assert!(weights.weights().count() == nb_workers as usize);
+        assert!(weights.weights().all_equal());
+        assert!(weights.weights().all(|weight| weight != 0));
+        drop(weights);
+
+        // Workers with bigger error ratio have less weight
+        for (i, stats) in worker_stats.iter().enumerate() {
+            stats.nb_requests_handled.store(100, Ordering::Relaxed);
+            stats
+                .nb_error_status_received
+                .store(100 - i as u64 * 10, Ordering::Relaxed);
+        }
+        lb_state.stats.recompute_weight(&lb_state).await.unwrap();
+        let weights = lb_state.stats.workers_weight.read().await;
+        assert!(weights.weights().is_sorted());
+        assert!(weights.weights().count() == nb_workers as usize);
+        assert!(weights.weights().all(|weight| weight != 0));
+        drop(weights);
     }
 }

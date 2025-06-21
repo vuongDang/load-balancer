@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+axum = { version = "0.8.4", features = ["tokio", "macros"] }
+rand = { version = "0.9.1", features = ["small_rng"] }
 tokio = { version = "1.45.1", features = ["full"] }
 color-eyre = "0.6.5"
 tracing = "0.1.41"
@@ -12,7 +15,6 @@ tracing-subscriber = { version = "0.3.19", features = [
     "registry",
     "env-filter",
 ] }
-axum = { version = "0.8.4", features = ["tokio"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 tower = "*"
 tower-http = { version = "0.6.4", features = ["trace"] }
@@ -22,8 +24,6 @@ reqwest = { version = "0.12.18", default-features = false, features = [
 ] }
 thiserror = "2.0.12"
 http = "*"
-rand = "0.9.1"
-serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 itertools = "0.14.0"
 futures = "0.3.31"
