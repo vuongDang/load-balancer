@@ -1,9 +1,5 @@
-use std::sync::atomic::AtomicUsize;
-
 use load_balancer::{
-    load_balancer::{balancing_strategy::BalancingStrategy, server::LoadBalancer},
-    tracing::init_tracing,
-    worker::WorkerServer,
+    load_balancer::server::LoadBalancer, tracing::init_tracing, worker::WorkerServer,
 };
 use tokio::task::JoinSet;
 
@@ -30,13 +26,9 @@ async fn main() {
     }
 
     // Start load balancer
-    let lb = LoadBalancer::build(
-        &format!("{}:3000", IP),
-        workers_config,
-        Some(BalancingStrategy::RoundRobin(AtomicUsize::default())),
-    )
-    .await
-    .expect("Failed to start load balander");
+    let lb = LoadBalancer::build(&format!("{}:3000", IP), workers_config, None)
+        .await
+        .expect("Failed to start load balander");
     let _ = lb.run().await;
     // workers.join_all().await;
 }

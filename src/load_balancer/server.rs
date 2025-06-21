@@ -1,4 +1,5 @@
 use crate::load_balancer::balancing_strategy::BalancingStrategy;
+use crate::load_balancer::metrics::{LoadBalancerStats, WorkerStatistics};
 use crate::worker::WorkerConfig;
 use axum::{
     Json, Router,
@@ -11,10 +12,7 @@ use axum::{
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info, trace};
@@ -37,13 +35,6 @@ pub struct WorkerView {
     pub stats: Arc<WorkerStatistics>,
 }
 
-#[derive(Default, Debug)]
-pub struct WorkerStatistics {
-    pub nb_requests_sent: AtomicU64,
-    pub nb_requests_handled: AtomicU64,
-    pub nb_error_status_received: AtomicU64,
-}
-
 #[derive(Clone, Debug)]
 pub struct LoadBalancerState {
     #[allow(dead_code)]
@@ -55,12 +46,6 @@ pub struct LoadBalancerState {
     pub(crate) stats: Arc<LoadBalancerStats>,
 }
 
-#[derive(Debug, Default)]
-pub struct LoadBalancerStats {
-    pub(crate) nb_requests_received: AtomicU64,
-    pub(crate) nb_errors: AtomicU64,
-}
-
 impl LoadBalancer {
     pub async fn build(
         addr: &str,
@@ -69,19 +54,13 @@ impl LoadBalancer {
     ) -> Result<Self, LoadBalancerError> {
         let listener = TcpListener::bind(addr).await?;
         let address = listener.local_addr()?.to_string();
-        let worker_views = workers
+        let address_clone = address.clone();
+        let workers = workers
             .into_iter()
-            .map(|config| WorkerView {
-                config,
-                stats: Arc::new(WorkerStatistics::default()),
-            })
+            .map(|config| WorkerView::new(config))
             .collect_vec();
-        let state = LoadBalancerState {
-            address: address.clone(),
-            workers: worker_views,
-            strategy: Arc::new(RwLock::new(strategy.unwrap_or_default())),
-            stats: Arc::new(LoadBalancerStats::default()),
-        };
+
+        let state = LoadBalancerState::new(address_clone, workers, strategy.unwrap_or_default());
         let router = LoadBalancer::router(state.clone());
         let server = axum::serve(listener, router);
 
@@ -103,6 +82,18 @@ impl LoadBalancer {
             .route("/balancing-strategy", post(set_balancing_strategy))
             .route("/{*key}", get(transfer_request).post(transfer_request))
             .with_state(state)
+    }
+}
+
+impl LoadBalancerState {
+    pub fn new(address: String, workers: Vec<WorkerView>, strategy: BalancingStrategy) -> Self {
+        let nb_workers = workers.len();
+        LoadBalancerState {
+            address,
+            workers,
+            strategy: Arc::new(RwLock::new(strategy)),
+            stats: Arc::new(LoadBalancerStats::new(nb_workers)),
+        }
     }
 }
 
@@ -237,7 +228,7 @@ impl LoadBalancer {
     /// When we need control on the strategy from the outside
     /// Meant to be used for tests
     #[cfg(test)]
-    async fn test_run(
+    pub async fn test_run(
         addr: &str,
         workers: Vec<WorkerConfig>,
     ) -> Result<LoadBalancerState, LoadBalancerError> {
@@ -250,7 +241,8 @@ impl LoadBalancer {
     /// When we need control on the strategy from the outside
     /// Meant to be used for tests
     #[cfg(test)]
-    async fn test_run_2(
+    #[allow(dead_code)]
+    pub async fn test_run_with_view(
         addr: &str,
         workers: Vec<WorkerView>,
     ) -> Result<LoadBalancerState, LoadBalancerError> {
@@ -286,12 +278,9 @@ impl WorkerView {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::atomic::AtomicUsize, time::Duration};
-
     use crate::worker::{WorkRequest, WorkerServer};
 
     use super::*;
-    use futures::future::join_all;
     use itertools::Itertools;
     use rand::seq::IndexedRandom;
     use serde_json::json;
@@ -345,143 +334,6 @@ mod tests {
                 .expect("Failed to execute request");
             assert_eq!(response.status().as_u16(), 200);
         }
-    }
-
-    #[tokio::test]
-    async fn error_statistics_are_taken_correctly() {
-        // let _ = crate::tracing::init_tracing("trace");
-        // We have 1 worker
-        let workers = WorkerView::test_workers(2);
-
-        // We start a loadbalancer without workers actually running
-        let load_balancer = LoadBalancer::build(
-            "127.0.0.1:0",
-            workers
-                .iter()
-                .map(|worker| worker.config.clone())
-                .collect_vec(),
-            Some(BalancingStrategy::RoundRobin(AtomicUsize::default())),
-        )
-        .await
-        .unwrap();
-        let worker_stats = load_balancer
-            .state
-            .workers
-            .iter()
-            .map(|worker| worker.stats.clone())
-            .collect_vec();
-        let lb_stats = load_balancer.state.stats.clone();
-        let lb_address = load_balancer.address.clone();
-        tokio::spawn(load_balancer.run());
-
-        let http_client = reqwest::Client::builder()
-            .build()
-            .expect("Failed to build HTTP client");
-
-        // Send two failing requests
-        for i in 0..2 {
-            let response = http_client
-                .get(&format!("http://{}/{}", lb_address, "check-health"))
-                .send()
-                .await
-                .expect("Failed to execute request");
-            assert!(response.status().is_server_error());
-            assert_eq!(
-                worker_stats[i]
-                    .nb_error_status_received
-                    .load(Ordering::Relaxed),
-                1
-            );
-            assert_eq!(worker_stats[i].nb_requests_sent.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                worker_stats[i].nb_requests_handled.load(Ordering::Relaxed),
-                1
-            );
-            assert_eq!(
-                lb_stats.nb_requests_received.load(Ordering::Relaxed),
-                i as u64 + 1
-            );
-        }
-        assert_eq!(lb_stats.nb_errors.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn success_statistics_are_taken_correctly() {
-        // Start a new server and start the new workers
-        let nb_workers = 4;
-        let workers =
-            join_all((0..nb_workers).map(|_| WorkerServer::create_and_run_worker())).await;
-        let lb_state = LoadBalancer::test_run("127.0.0.1:0", workers)
-            .await
-            .unwrap();
-        let worker_stats = lb_state
-            .workers
-            .iter()
-            .map(|worker| worker.stats.clone())
-            .collect_vec();
-        let lb_stats = lb_state.stats;
-
-        let http_client = reqwest::Client::builder()
-            .build()
-            .expect("Failed to build HTTP client");
-
-        // Send succesfull requests anc check stats
-        for i in 0..nb_workers {
-            let _response = http_client
-                .get(&format!("http://{}/{}", lb_state.address, "check-health"))
-                .send()
-                .await
-                .expect("Failed to execute request");
-            assert_eq!(
-                worker_stats[i]
-                    .nb_error_status_received
-                    .load(Ordering::Relaxed),
-                0
-            );
-            assert_eq!(worker_stats[i].nb_requests_sent.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                worker_stats[i].nb_requests_handled.load(Ordering::Relaxed),
-                1
-            );
-            assert_eq!(
-                lb_stats.nb_requests_received.load(Ordering::Relaxed),
-                i as u64 + 1
-            );
-            assert_eq!(lb_stats.nb_errors.load(Ordering::Relaxed), 0);
-        }
-
-        for _ in 0..nb_workers {
-            // Send a long request to the server that takes 10 seconds
-            let json = json!(WorkRequest { duration: 20000 });
-            tokio::spawn(
-                http_client
-                    .post(&format!("http://{}/{}", lb_state.address, "work"))
-                    .json(&json)
-                    .send(),
-            );
-        }
-
-        // Wait a bit to let the load balancer have time to send the request to the worker server
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        for i in 0..nb_workers {
-            assert_eq!(
-                worker_stats[i]
-                    .nb_error_status_received
-                    .load(Ordering::Relaxed),
-                0
-            );
-            assert_eq!(worker_stats[i].nb_requests_sent.load(Ordering::Relaxed), 2);
-            assert_eq!(
-                worker_stats[i].nb_requests_handled.load(Ordering::Relaxed),
-                1
-            );
-        }
-        assert_eq!(
-            lb_stats.nb_requests_received.load(Ordering::Relaxed),
-            nb_workers as u64 * 2
-        );
-        assert_eq!(lb_stats.nb_errors.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

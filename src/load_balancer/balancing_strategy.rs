@@ -5,7 +5,7 @@ use crate::{
 };
 use BalancingStrategy::*;
 use color_eyre::eyre::eyre;
-use rand::seq::IndexedRandom;
+use rand::{distr::Distribution, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicUsize;
 use strum_macros::AsRefStr;
@@ -18,6 +18,7 @@ pub enum BalancingStrategy {
     LeastConnectionWithInternalStats,
     Random,
     ResourceBased,
+    WeightedWorkers,
 }
 
 impl Default for BalancingStrategy {
@@ -47,6 +48,7 @@ impl BalancingStrategy {
             LeastConnectionWithInternalStats => {
                 least_connection_with_internal_stats(&workers).await?
             }
+            WeightedWorkers => weighted_workers(state, &workers).await?,
             ResourceBased => unimplemented!(),
         };
 
@@ -130,6 +132,21 @@ async fn least_connection_with_internal_stats(
     Ok(worker_with_min_request_being_handled)
 }
 
+/// Select worker depending on the weight assigned to each
+async fn weighted_workers<'a>(
+    lb_state: &LoadBalancerState,
+    workers: &'a [WorkerView],
+) -> Result<&'a WorkerView, LoadBalancerError> {
+    // TODO should I create a new seed each time?
+    let mut rng = rand::rng();
+    let index_of_next_worker = lb_state.stats.workers_weight.sample(&mut rng);
+    workers
+        .get(index_of_next_worker)
+        .ok_or(LoadBalancerError::InternalError(eyre!(
+            "No workers in the config"
+        )))
+}
+
 // Make a request to a worker about its state
 async fn request_worker_state(
     worker: &WorkerConfig,
@@ -158,6 +175,7 @@ impl PartialEq for BalancingStrategy {
             (LeastConnectionWithInternalStats, LeastConnectionWithInternalStats) => true,
             (Random, Random) => true,
             (ResourceBased, ResourceBased) => true,
+            (WeightedWorkers, WeightedWorkers) => true,
             _ => false,
         }
     }
@@ -168,18 +186,7 @@ impl Serialize for BalancingStrategy {
     where
         S: serde::Serializer,
     {
-        use BalancingStrategy::*;
-        match self {
-            RoundRobin(_) => serializer.serialize_str("RoundRobin"),
-            LeastConnectionWithStatsFromWorkers => {
-                serializer.serialize_str("LeastConnectionWithStatsFromWorkers")
-            }
-            LeastConnectionWithInternalStats => {
-                serializer.serialize_str("LeastConnectionWithInternalStats")
-            }
-            Random => serializer.serialize_str("Random"),
-            ResourceBased => serializer.serialize_str("ResourceBased"),
-        }
+        serializer.serialize_str(self.as_ref())
     }
 }
 
@@ -199,6 +206,7 @@ impl<'de> Deserialize<'de> for BalancingStrategy {
             }
             "Random" => Ok(BalancingStrategy::Random),
             "ResourceBased" => Ok(BalancingStrategy::ResourceBased),
+            "WeightedWorkers" => Ok(BalancingStrategy::WeightedWorkers),
             _ => Err(serde::de::Error::custom(format!(
                 "Unknown balancing strategy: {}",
                 s
@@ -209,12 +217,15 @@ impl<'de> Deserialize<'de> for BalancingStrategy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures::future::join_all;
     use itertools::Itertools;
+    use rand::distr::weighted::WeightedIndex;
     use serde_json::json;
 
     use super::*;
-    use crate::worker::WorkerServer;
+    use crate::{load_balancer::metrics::LoadBalancerStats, worker::WorkerServer};
 
     #[tokio::test]
     async fn round_robin_picks_next_worker() {
@@ -296,5 +307,59 @@ mod tests {
             .await
             .expect("Failed to find next worker");
         assert_eq!(next_worker.config, workers.last().unwrap().config)
+    }
+
+    #[tokio::test]
+    async fn weighted_workers_is_correct() {
+        let nb_workers = 5;
+        let workers = WorkerView::test_workers(nb_workers);
+        let mut lb_state = LoadBalancerState::new(
+            "127.0.0.1".to_owned(),
+            workers.clone(),
+            BalancingStrategy::WeightedWorkers,
+        );
+
+        // Picked worker exists in the config
+        for _ in 1..=10 {
+            let next_worker = weighted_workers(&lb_state, &workers)
+                .await
+                .expect("should not fail");
+            assert!(
+                workers
+                    .iter()
+                    .find(|worker| worker.config == next_worker.config)
+                    .is_some()
+            );
+        }
+
+        // Weigthed distribution works correctly
+        // Only first index has some weight
+        let mut weights = [0u32, 0, 0, 0, 0];
+        for i in 0..nb_workers as usize {
+            weights.fill(0);
+            weights[i] = 1;
+            let mut stats = LoadBalancerStats::new(nb_workers as usize);
+            stats.workers_weight = WeightedIndex::new(weights).unwrap();
+            lb_state.stats = Arc::new(stats);
+            let next_worker = weighted_workers(&lb_state, &workers)
+                .await
+                .expect("should not fail");
+            assert_eq!(next_worker.config, workers[i].config);
+        }
+
+        let weights = [1u32, 0, 1, 0, 1];
+        for _ in 0..nb_workers as usize {
+            let mut stats = LoadBalancerStats::new(nb_workers as usize);
+            stats.workers_weight = WeightedIndex::new(weights).unwrap();
+            lb_state.stats = Arc::new(stats);
+            let next_worker = weighted_workers(&lb_state, &workers)
+                .await
+                .expect("should not fail");
+            assert!(
+                next_worker.config == workers[0].config
+                    || next_worker.config == workers[2].config
+                    || next_worker.config == workers[4].config
+            );
+        }
     }
 }
